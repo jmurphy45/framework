@@ -37,6 +37,13 @@ class RouteCollection extends AbstractRouteCollection
     protected $actionList = [];
 
     /**
+     * Per-method radix tries used to quickly narrow down route candidates.
+     *
+     * @var array<string, \Illuminate\Routing\RouteTree>
+     */
+    protected $trees = [];
+
+    /**
      * Add a Route instance to the collection.
      *
      * @param  \Illuminate\Routing\Route  $route
@@ -63,9 +70,27 @@ class RouteCollection extends AbstractRouteCollection
 
         foreach ($route->methods() as $method) {
             $this->routes[$method][$domainAndUri] = $route;
+
+            $this->addToTree($method, $route);
         }
 
         $this->allRoutes[$method.$domainAndUri] = $route;
+    }
+
+    /**
+     * Insert the route into the radix trie for the given HTTP method.
+     *
+     * @param  string  $method
+     * @param  \Illuminate\Routing\Route  $route
+     * @return void
+     */
+    protected function addToTree(string $method, Route $route)
+    {
+        if (! isset($this->trees[$method])) {
+            $this->trees[$method] = new RouteTree;
+        }
+
+        $this->trees[$method]->add($route);
     }
 
     /**
@@ -152,14 +177,43 @@ class RouteCollection extends AbstractRouteCollection
      */
     public function match(Request $request)
     {
-        $routes = $this->get($request->getMethod());
+        // Use the radix trie to narrow candidates to structurally compatible routes
+        // before running the full validator chain (URI regex, scheme, host, method).
+        // This avoids O(n) regex evaluation across every registered route.
+        $candidates = $this->getCandidatesFromTree($request);
 
-        // First, we will see if we can find a matching route for this current request
-        // method. If we can, great, we can just return it so that it can be called
-        // by the consumer. Otherwise we will check for routes with another verb.
-        $route = $this->matchAgainstRoutes($routes, $request);
+        $route = $this->matchAgainstRoutes($candidates, $request);
 
         return $this->handleMatchedRoute($request, $route);
+    }
+
+    /**
+     * Retrieve candidate routes from the radix trie for the given request.
+     *
+     * Falls back to the full flat route list when no trie has been built for the
+     * request method (e.g. the collection was populated before this feature was
+     * introduced, or the method is completely unknown).
+     *
+     * @param  \Illuminate\Http\Request  $request
+     * @return \Illuminate\Routing\Route[]
+     */
+    protected function getCandidatesFromTree(Request $request): array
+    {
+        $method = $request->getMethod();
+
+        if (! isset($this->trees[$method])) {
+            return $this->get($method);
+        }
+
+        // Strip leading slash and URL-decode so the path matches how URIs are
+        // stored in the trie (e.g. "users/42" rather than "/users/42").
+        $path = ltrim(rawurldecode($request->getPathInfo()), '/');
+
+        $candidates = $this->trees[$method]->getCandidates($path);
+
+        // If the trie produced no candidates, fall back to the full list so that
+        // edge cases (e.g. routes added without going through add()) still resolve.
+        return $candidates ?: $this->get($method);
     }
 
     /**
